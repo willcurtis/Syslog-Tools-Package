@@ -1,7 +1,10 @@
 """
-syslog-tui — TUI syslog collector (UDP/TCP/TLS) with live, colourised view, scrollback, search, filters, and save.
+syslog-tui — TUI syslog collector (UDP/TCP/TLS) with live, colourised view, scrollback, search,
+filters, save, and optional logging to file (plain/json/raw) with size-based rotation.
 """
 import argparse
+import json
+import os
 import queue
 import socket
 import ssl
@@ -98,7 +101,7 @@ def parse_syslog(line: bytes):
             "format": fmt, **body, "raw": line}
 
 class UDPServerThread(threading.Thread):
-    def __init__(self, host: str, port: int, outq: queue.Queue, stop_event: threading.Event):
+    def __init__(self, host: str, port: int, outq, stop_event: threading.Event):
         super().__init__(daemon=True)
         self.host = host; self.port = port; self.outq = outq; self.stop_event = stop_event; self.sock = None
     def run(self):
@@ -145,7 +148,7 @@ class UDPServerThread(threading.Thread):
         except Exception: pass
 
 class ThreadedTCPServer(threading.Thread):
-    def __init__(self, host: str, port: int, outq: queue.Queue, stop_event: threading.Event, tls_ctx: ssl.SSLContext = None):
+    def __init__(self, host: str, port: int, outq, stop_event: threading.Event, tls_ctx: ssl.SSLContext = None):
         super().__init__(daemon=True)
         self.host = host; self.port = port; self.outq = outq; self.stop_event = stop_event; self.tls_ctx = tls_ctx; self.sock = None
     def run(self):
@@ -237,28 +240,97 @@ class ThreadedTCPServer(threading.Thread):
         parsed["src"] = peer
         self.outq.put({"type": "log", **parsed})
 
-def make_server_tls_context(certfile: str, keyfile: str, cafile: str = None, require_client_cert: bool = False, insecure: bool = False):
-    if not certfile or not keyfile:
-        raise ValueError("TLS requires --certfile and --keyfile")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(certfile, keyfile)
-    if cafile:
-        ctx.load_verify_locations(cafile)
-        ctx.verify_mode = ssl.CERT_REQUIRED if require_client_cert else ssl.CERT_OPTIONAL
-    else:
-        ctx.verify_mode = ssl.CERT_NONE
-    if insecure:
-        ctx.verify_mode = ssl.CERT_NONE
-    return ctx
+class FileLogger(threading.Thread):
+    def __init__(self, path: str, fmt: str = "plain", rotate_size: int = 0, rotate_keep: int = 3, sync: bool = False):
+        super().__init__(daemon=True)
+        self.q = queue.Queue(maxsize=50000)
+        self.path = path
+        self.fmt = fmt
+        self.rotate_size = max(0, int(rotate_size or 0))
+        self.rotate_keep = max(0, int(rotate_keep or 0))
+        self.sync = bool(sync)
+        self._stop = threading.Event()
+        self._fh = None
+    def put(self, item: dict):
+        try: self.q.put_nowait(item)
+        except queue.Full: pass
+    def stop(self): self._stop.set()
+    def _open(self):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self._fh = open(self.path, "a", encoding="utf-8")
+    def _should_rotate(self):
+        if self.rotate_size <= 0: return False
+        try: return self._fh.tell() >= self.rotate_size
+        except Exception:
+            try: return os.path.getsize(self.path) >= self.rotate_size
+            except Exception: return False
+    def _rotate(self):
+        try: self._fh.close()
+        except Exception: pass
+        for i in range(self.rotate_keep-1, 0, -1):
+            src = f"{self.path}.{i}"; dst = f"{self.path}.{i+1}"
+            if os.path.exists(src):
+                try: os.replace(src, dst)
+                except Exception: pass
+        try:
+            if os.path.exists(self.path): os.replace(self.path, f"{self.path}.1}")
+        except Exception: pass
+        self._open()
+    def _format_line(self, item: dict) -> str:
+        if item.get("type") != "log": return ""
+        if self.fmt == "raw":
+            return (item.get("raw") or b"").decode("utf-8", "replace")
+        if self.fmt == "json":
+            d = {k: item.get(k, "") for k in (
+                "ts","host","app","procid","msgid","sd","msg",
+                "facility","facility_name","severity","severity_name","format","src"
+            )}
+            return json.dumps(d, ensure_ascii=False)
+        ts = item.get("ts",""); sev = item.get("severity_name","INFO")
+        host = item.get("host",""); app = item.get("app",""); msg = item.get("msg","")
+        return f"{ts} {sev:<6} {host} {app} — {msg}"
+    def run(self):
+        try: self._open()
+        except Exception: return
+        while not self._stop.is_set():
+            try: item = self.q.get(timeout=0.5)
+            except queue.Empty: continue
+            line = self._format_line(item)
+            if not line: continue
+            try:
+                self._fh.write(line + "\n")
+                if self.sync:
+                    self._fh.flush(); os.fsync(self._fh.fileno())
+                elif self._fh.tell() % 4096 < len(line) + 128:
+                    self._fh.flush()
+                if self._should_rotate():
+                    self._rotate()
+            except Exception:
+                pass
+        try: self._fh.flush(); self._fh.close()
+        except Exception: pass
+
+class FanoutSink:
+    def __init__(self, *targets):
+        self.targets = targets
+    def put(self, item):
+        for t in self.targets:
+            try:
+                if hasattr(t, "put"):
+                    t.put(item)
+                else:
+                    t.put_nowait(item)
+            except Exception:
+                pass
 
 class TUI:
-    def __init__(self, stdscr, outq: queue.Queue, stop_event: threading.Event, min_sev: int):
+    def __init__(self, stdscr, outq: queue.Queue, stop_event: threading.Thread, min_sev: int):
         self.stdscr = stdscr
         self.outq = outq
         self.stop_event = stop_event
         self.paused = False
         self.min_sev = min_sev
-        self.lines = []             # list of dict(sev,int,text,str,host,app)
+        self.lines = []
         self.max_lines = 20000
         self.total = 0
         self.count_by_sev = [0]*8
@@ -272,7 +344,6 @@ class TUI:
         self.search_pos = -1
         self.filtered_idx = []
         self.dirty = True
-
     def run(self):
         curses.curs_set(0)
         self.stdscr.nodelay(True)
@@ -292,14 +363,12 @@ class TUI:
             if now - last_draw > (1/30):
                 self._draw(); last_draw = now
             time.sleep(0.01)
-
     def _init_colors(self):
         pairs = [(1, curses.COLOR_RED),(2, curses.COLOR_MAGENTA),(3, curses.COLOR_MAGENTA),(4, curses.COLOR_RED),
                  (5, curses.COLOR_YELLOW),(6, curses.COLOR_CYAN),(7, -1),(8, curses.COLOR_BLUE)]
         for idx, color in pairs:
             try: curses.init_pair(idx, color, -1)
             except Exception: pass
-
     def _on_log(self, rec):
         self.total += 1
         sev = rec.get("severity", 6)
@@ -315,12 +384,10 @@ class TUI:
             drop = len(self.lines) - self.max_lines
             self.lines = self.lines[drop:]
         self.dirty = True
-
     def _on_event(self, text: str):
         ts = datetime.now().strftime("%H:%M:%S")
         self.status_msgs.append(f"{ts} {text}")
         if len(self.status_msgs) > 5: self.status_msgs = self.status_msgs[-5:]
-
     def _prompt(self, prompt_text: str, initial: str = ""):
         h, w = self.stdscr.getmaxyx()
         curses.curs_set(1); self.stdscr.nodelay(False)
@@ -346,7 +413,6 @@ class TUI:
             except Exception: c = ""
             if c and curses.ascii.isprint(ch):
                 buf.insert(pos, c); pos += 1
-
     def _handle_keys(self):
         try: ch = self.stdscr.getch()
         except Exception: ch = -1
@@ -398,24 +464,19 @@ class TUI:
             except Exception as e:
                 self._on_event(f"Save failed: {e}")
             return
-
     def _scroll_lines(self, n):
         max_off = max(0, len(self._filtered()) - 1)
         self.scroll_offset = min(max(0, self.scroll_offset + n), max_off)
-
     def _scroll_page(self, n_pages):
         h, w = self.stdscr.getmaxyx()
         view_top = 6 if self.help_visible else 4
         max_rows = max(0, h - view_top - 1)
         delta = n_pages * max(1, max_rows - 1)
         self._scroll_lines(delta)
-
     def _scroll_to_top(self):
         self.scroll_offset = max(0, len(self._filtered()) - 1)
-
     def _scroll_to_bottom(self):
         self.scroll_offset = 0
-
     def _scroll_to_filtered_index(self, i):
         filtered = self._filtered(); F = len(filtered)
         if F == 0: self.scroll_offset = 0; return
@@ -423,7 +484,6 @@ class TUI:
         view_top = 6 if self.help_visible else 4
         R = max(0, h - view_top - 1)
         self.scroll_offset = max(0, F - R - i)
-
     def _filtered(self):
         if not self.dirty:
             return self.filtered_idx
@@ -445,7 +505,6 @@ class TUI:
         if self.search_pos >= len(self.search_matches): self.search_pos = -1
         self.dirty = False
         return self.filtered_idx
-
     def _current_visible_subset(self):
         filtered = self._filtered()
         h, w = self.stdscr.getmaxyx()
@@ -459,7 +518,6 @@ class TUI:
         for idx in filtered[start:end]:
             it = self.lines[idx]; out.append((it["sev"], it["text"]))
         return out
-
     def _draw(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
@@ -505,13 +563,19 @@ class TUI:
         except Exception: pass
         self.stdscr.refresh()
 
-def make_tls_ctx(args):
-    if not args.tls: return None
-    try:
-        return make_server_tls_context(args.certfile, args.keyfile, cafile=args.cafile,
-                                       require_client_cert=args.require_client_cert, insecure=args.insecure)
-    except Exception as e:
-        print(f"TLS setup failed: {e}", file=sys.stderr); sys.exit(2)
+def make_server_tls_context(certfile: str, keyfile: str, cafile: str = None, require_client_cert: bool = False, insecure: bool = False):
+    if not certfile or not keyfile:
+        raise ValueError("TLS requires --certfile and --keyfile")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile, keyfile)
+    if cafile:
+        ctx.load_verify_locations(cafile)
+        ctx.verify_mode = ssl.CERT_REQUIRED if require_client_cert else ssl.CERT_OPTIONAL
+    else:
+        ctx.verify_mode = ssl.CERT_NONE
+    if insecure:
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 def main():
     ap = argparse.ArgumentParser(description="TUI syslog collector (UDP/TCP/TLS) with live, colorised output.")
@@ -526,25 +590,62 @@ def main():
     ap.add_argument("--require-client-cert", action="store_true", help="Require and verify client certificates (mTLS)")
     ap.add_argument("--insecure", action="store_true", help="Do not verify client certificate (TLS)")
     ap.add_argument("--min-severity", type=int, default=7, help="Initial minimum severity to display (0=EMERG .. 7=DEBUG). Show severities <= value.")
+    ap.add_argument("--log-file", help="Append logs to this file (plain text unless --log-format set)")
+    ap.add_argument("--log-format", choices=["plain","json","raw"], default="plain", help="File output format (default: plain)")
+    ap.add_argument("--log-rotate-size", type=int, default=0, help="Rotate when file exceeds N bytes (0=disable)")
+    ap.add_argument("--log-rotate-keep", type=int, default=3, help="Keep N rotated files (default 3)")
+    ap.add_argument("--log-sync", action="store_true", help="Flush & fsync after each line (slower)")
     args = ap.parse_args()
 
-    tls_ctx = make_tls_ctx(args)
-    outq = queue.Queue(maxsize=10000); stop_event = threading.Event()
+    ui_q = queue.Queue(maxsize=10000)
+    stop_event = threading.Event()
+    file_logger = None
+    if args.log_file:
+        file_logger = FileLogger(args.log_file, fmt=args.log_format, rotate_size=args.log_rotate_size,
+                                 rotate_keep=args.log_rotate_keep, sync=args.log_sync)
+        file_logger.start()
+
+    class FanoutSink:
+        def __init__(self, *targets): self.targets = targets
+        def put(self, item):
+            for t in self.targets:
+                try:
+                    if hasattr(t, "put"): t.put(item)
+                    else: t.put_nowait(item)
+                except Exception: pass
+
+    sink_targets = [ui_q]
+    if file_logger: sink_targets.append(file_logger)
+    out_sink = FanoutSink(*sink_targets)
 
     threads = []
     if args.udp_port > 0:
-        t = UDPServerThread(args.udp_host, args.udp_port, outq, stop_event); t.start(); threads.append(t)
+        t = UDPServerThread(args.udp_host, args.udp_port, out_sink, stop_event); t.start(); threads.append(t)
     if args.tcp_port > 0:
-        t = ThreadedTCPServer(args.tcp_host, args.tcp_port, outq, stop_event, tls_ctx=tls_ctx); t.start(); threads.append(t)
+        tls_ctx = None
+        if args.tls:
+            try:
+                tls_ctx = make_server_tls_context(args.certfile, args.keyfile, cafile=args.cafile,
+                                                  require_client_cert=args.require_client_cert, insecure=args.insecure)
+            except Exception as e:
+                print(f"TLS setup failed: {e}", file=sys.stderr); sys.exit(2)
+        t = ThreadedTCPServer(args.tcp_host, args.tcp_port, out_sink, stop_event, tls_ctx=tls_ctx); t.start(); threads.append(t)
     if not threads:
         print("No listeners enabled. Set --udp-port and/or --tcp-port to non-zero.", file=sys.stderr); sys.exit(1)
 
+    if file_logger:
+        ui_q.put({"type":"event","msg":f"[LOG] Writing to {args.log_file} format={args.log_format} rotate_size={args.log_rotate_size} keep={args.log_rotate_keep} sync={'on' if args.log_sync else 'off'}"})
+
     try:
-        curses.wrapper(lambda stdscr: TUI(stdscr, outq, stop_event, min_sev=args.min_severity).run())
+        curses.wrapper(lambda stdscr: TUI(stdscr, ui_q, stop_event, min_sev=args.min_severity).run())
     except KeyboardInterrupt:
         pass
     finally:
-        stop_event.set(); time.sleep(0.2)
+        stop_event.set()
+        time.sleep(0.2)
+        if file_logger:
+            file_logger.stop()
+            time.sleep(0.2)
 
 if __name__ == "__main__":
     main()

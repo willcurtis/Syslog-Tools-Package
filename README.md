@@ -42,4 +42,4 @@ sudo setcap 'cap_net_bind_service=+ep' $(readlink -f $(which python3))
 ```
 
 ## License
-TBD by repository owner (e.g., MIT, BSD-2-Clause, Apache-2.0).
+MIT

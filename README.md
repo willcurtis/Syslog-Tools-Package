@@ -166,4 +166,4 @@ sudo syslog-tui --tcp-port 10514 --log-file ./collector.jsonl --log-format json 
 
 ## License
 
-TBD by repository owner (e.g., MIT, BSD‑2‑Clause, Apache‑2.0).
+MIT

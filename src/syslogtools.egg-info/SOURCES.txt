@@ -1,0 +1,11 @@
+LICENSE
+README.md
+pyproject.toml
+src/syslogtools/__init__.py
+src/syslogtools/pro.py
+src/syslogtools/tui.py
+src/syslogtools.egg-info/PKG-INFO
+src/syslogtools.egg-info/SOURCES.txt
+src/syslogtools.egg-info/dependency_links.txt
+src/syslogtools.egg-info/entry_points.txt
+src/syslogtools.egg-info/top_level.txt

@@ -273,7 +273,7 @@ class FileLogger(threading.Thread):
                 try: os.replace(src, dst)
                 except Exception: pass
         try:
-            if os.path.exists(self.path): os.replace(self.path, f"{self.path}.1}")
+            if os.path.exists(self.path): os.replace(self.path, f"{self.path}.1")
         except Exception: pass
         self._open()
     def _format_line(self, item: dict) -> str:

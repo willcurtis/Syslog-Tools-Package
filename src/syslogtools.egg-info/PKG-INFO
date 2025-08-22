@@ -1,0 +1,180 @@
+Metadata-Version: 2.4
+Name: syslogtools
+Version: 0.1.1
+Summary: Syslog sender (pro) and TUI collector
+Author: Your Name
+License: MIT
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Dynamic: license-file
+
+# syslogtools — Syslog Sender & TUI Collector
+
+`syslogtools` bundles two CLI utilities to help you **generate** and **collect** syslog for troubleshooting:
+
+- **`syslog-pro`** — a professional syslog generator (RFC3164/5424, UDP/TCP/**TLS**, RFC6587 framing, templating, rate control).
+- **`syslog-tui`** — a curses-based, colourised syslog collector with live view, scrollback, search, filters, **file logging** (+ rotation), UDP/TCP/**TLS**, RFC3164/5424.
+
+> **Note:** In most environments **sudo is required when setting a bind address** and always for privileged ports such as **514/6514**. On Linux you can alternatively grant `CAP_NET_BIND_SERVICE` to your Python interpreter.
+
+---
+
+## Requirements
+
+- Python **3.8+**
+- A terminal that supports **curses** (Linux/macOS; on Windows use WSL)
+- Appropriate permissions (see note above)
+
+---
+
+## Install
+
+Editable (dev-friendly):
+```bash
+unzip syslogtools_pkg.zip
+cd syslogtools_pkg
+python3 -m pip install -e .
+```
+
+Standard install (from a working directory):
+```bash
+python3 -m pip install .
+```
+
+This provides two console scripts on your PATH:
+- `syslog-pro` — syslog sender
+- `syslog-tui` — TUI collector
+
+---
+
+## Quick start
+
+Send 10 RFC5424 messages over TCP (octet framing) to 10514:
+```bash
+syslog-pro 127.0.0.1 --transport tcp -p 10514 --format 5424 -n 10 -m "hello {seq}"
+```
+
+Collect over UDP on 5514 with live TUI:
+```bash
+sudo syslog-tui --udp-host 0.0.0.0 --udp-port 5514 --tcp-port 0
+```
+
+Enable TLS (server mode) on 6514 with a cert/key:
+```bash
+sudo syslog-tui --udp-port 0 --tcp-host :: --tcp-port 6514 --tls --certfile server.crt --keyfile server.key
+```
+
+Log everything to JSONL with rotation:
+```bash
+sudo syslog-tui --udp-port 5514 --tcp-port 0   --log-file ./collector.jsonl --log-format json --log-rotate-size 10485760 --log-rotate-keep 5
+```
+
+---
+
+## `syslog-pro` — Sender
+
+### Highlights
+- **Formats:** RFC3164 (BSD) and RFC5424
+- **Transports:** UDP, TCP, optional **TLS** (client)
+- **Framing (TCP):** **RFC6587** octet-counted (`--tcp-framing octet`) or LF-delimited (`--tcp-framing lf`)
+- **Templating:** `{seq}`, `{uuid}`, `{timestamp}`, `{hostname}`, `{app}`, `{facility}`, `{severity}`, `{randint:a:b}`
+- **Rate control:** fixed delay or token-bucket target rate
+- **Sources:** inline `-m/--message`, `--from-file`, or `--stdin`
+- **Extras:** choose facility/severity by name or number; pad size; echo/dry-run; bind local source IP
+
+### Usage (abridged)
+```text
+syslog-pro TARGET [-p PORT] [--transport {udp,tcp}] [--tls] [--tcp-framing {octet,lf}]
+                  [--cafile FILE] [--certfile FILE] [--keyfile FILE] [--insecure] [--sni NAME]
+                  [--bind-ip IP]
+                  [--format {3164,5424}] [--facility FAC] [--severity SEV]
+                  [--app NAME] [--hostname NAME] [--procid ID] [--msgid ID] [--sd STR]
+                  [--message MSG | --from-file FILE | --stdin]
+                  [-n COUNT | --duration SEC] [--rate R] [--delay SEC] [--interval SEC]
+                  [--size BYTES] [--echo] [--dry-run] [-v]
+```
+
+**Examples**
+```bash
+# RFC3164 over UDP 514
+syslog-pro 192.0.2.10 -p 514 --format 3164 -n 100 -m "{timestamp} link flap {seq}"
+
+# RFC5424 with structured data over TCP/TLS 6514
+syslog-pro example.net --transport tcp --tls -p 6514 --format 5424   --sd '[example@32473 iut="3" eventSource="App" eventID="1011"]' -n 5 -m "event {seq}"
+```
+
+---
+
+## `syslog-tui` — Collector
+
+### Highlights
+- **Transports:** UDP, TCP, optional **TLS** (server-side)
+- **Framing (TCP):** auto-detects **RFC6587 octet-counted** and **LF-delimited**
+- **Formats:** parses **RFC3164** and **RFC5424**
+- **Binding:** IPv4/IPv6 (`--udp-host`, `--tcp-host`)
+- **TUI:** live colour by severity, counters, scrollback, search, host/app filters, save visible window
+- **File logging:** `--log-file` with formats **plain/json/raw**, size-based rotation, optional fsync
+
+### CLI (abridged)
+```text
+syslog-tui [--udp-host IP] [--udp-port N] [--tcp-host IP] [--tcp-port N]
+           [--tls --certfile CERT --keyfile KEY] [--cafile CA] [--require-client-cert] [--insecure]
+           [--min-severity N]
+           [--log-file PATH] [--log-format {plain,json,raw}] [--log-rotate-size BYTES]
+           [--log-rotate-keep N] [--log-sync]
+```
+
+**Keys**
+- Quit **q**
+- Pause **p**
+- Clear **c**
+- Severity threshold **[** / **]** (0=EMERG .. 7=DEBUG)
+- Help **h** / **?**
+- Scroll **↑/k**, **↓/j**, **PgUp/PgDn**, **Home(g)/End(G)**
+- Search **/**, next **n**, prev **N**
+- Filters: **H** host, **A** app
+- Save visible window: **s**
+
+**File logging examples**
+```bash
+# Plain text with 10MB rotation (keep 5)
+sudo syslog-tui --udp-port 5514 --tcp-port 0   --log-file /var/log/syslog-tui/collector.log --log-format plain   --log-rotate-size 10485760 --log-rotate-keep 5
+
+# JSONL with fsync per line
+sudo syslog-tui --tcp-port 10514 --log-file ./collector.jsonl --log-format json --log-sync
+```
+
+---
+
+## Binding & privileges
+
+- **sudo is typically required when setting a bind address** and always for ports **<1024** (e.g., 514/6514).
+- Linux alternative (bind low ports without sudo):
+  ```bash
+  sudo setcap 'cap_net_bind_service=+ep' $(readlink -f $(which python3))
+  # revert:
+  sudo setcap -r $(readlink -f $(which python3))
+  ```
+
+---
+
+## Troubleshooting
+
+- **EADDRINUSE / permission denied** — Port already in use or lacks privileges; try `sudo`, change port, or set capabilities.
+- **No logs showing** — Verify sender protocol/port/framing/format; try UDP vs TCP.
+- **TLS handshake errors** — Check server cert/key paths, client trust (CA), and SNI.
+- **High volume** — Prefer TCP, enlarge terminal window, enable `--log-file` to persist.
+
+---
+
+## Security
+
+- Minimise privileges; prefer non‑privileged ports where possible.
+- Limit inbound networks to trusted sources when running the collector.
+
+---
+
+## License
+
+MIT
